@@ -493,7 +493,7 @@ chmod 0755 /var/run/sshd
 
 ```bash
 #!/bin/sh
-set -eu                              # 遇到错误立即退出；变量未定义时报错
+set -eu
 
 # ============ 参数检查 ============
 if [ $# -lt 1 ]; then
@@ -502,132 +502,168 @@ if [ $# -lt 1 ]; then
 fi
 
 # ============ 变量定义 ============
-PKG="$1"                             # OTA 升级包路径（从命令行第 1 个参数传入）
-WORKDIR="/tmp/gec6818-ota"           # 临时工作目录
-BACKUPDIR="/root/ota-backup"         # 旧文件备份目录
+PKG="$1"
+WORKDIR="/tmp/gec6818-ota"
+BACKUPDIR="/root/ota-backup"
 
-# 检查是否传入了升级包路径
-if [ -z "$PKG" ]; then
-    echo "Usage: ota-local-update.sh <ota-package.tar.gz>"
-    exit 1
-fi
-
-# 检查升级包文件是否存在
+# ============ 检查 OTA 包 ============
 if [ ! -f "$PKG" ]; then
     echo "ERROR: OTA package not found: $PKG"
     exit 1
 fi
 
 echo "==== CLEAN WORKDIR ===="
-rm -rf "$WORKDIR"                    # 清空上次残留的工作目录
-mkdir -p "$WORKDIR"                  # 重新创建工作目录
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
 
 echo "==== EXTRACT PACKAGE ===="
-tar -xzf "$PKG" -C "$WORKDIR"        # 解压 OTA 升级包到工作目录
+tar -xzf "$PKG" -C "$WORKDIR"
 
-cd "$WORKDIR"                        # 进入工作目录
+cd "$WORKDIR"
 
 echo "==== CHECK MANIFEST ===="
-# 检查清单文件是否存在
 if [ ! -f manifest.txt ]; then
     echo "ERROR: manifest.txt missing"
     exit 1
 fi
 
-cat manifest.txt                     # 打印清单内容，供用户确认
+cat manifest.txt
 
-# 验证目标板型号是否为 gec6818
 if ! grep -q '^board=gec6818$' manifest.txt; then
     echo "ERROR: board is not gec6818"
     exit 1
 fi
 
-# 验证 OTA 升级类型是否为文件更新（file-update）
 if ! grep -q '^type=file-update$' manifest.txt; then
     echo "ERROR: unsupported OTA type"
     exit 1
 fi
 
 echo "==== CHECK SHA256 ===="
-# 检查校验和文件是否存在
 if [ ! -f sha256sum.txt ]; then
     echo "ERROR: sha256sum.txt missing"
     exit 1
 fi
 
-# 校验所有文件的 SHA256 哈希值，确保包完整性
 sha256sum -c sha256sum.txt
 
 echo "==== BACKUP OLD FILES ===="
-mkdir -p "$BACKUPDIR"                # 创建备份目录
+mkdir -p "$BACKUPDIR"
 
-# 备份版本信息文件
 if [ -f /etc/gec6818-version ]; then
     cp -a /etc/gec6818-version "$BACKUPDIR/gec6818-version.bak"
 fi
 
-# 备份旧的检查脚本
 if [ -f /usr/local/bin/gec6818-check.sh ]; then
     cp -a /usr/local/bin/gec6818-check.sh "$BACKUPDIR/gec6818-check.sh.bak"
 fi
 
-# 备份 SSH tmpfiles 配置（用于 systemd 自动创建 /run/sshd 目录）
 if [ -f /etc/tmpfiles.d/sshd.conf ]; then
     cp -a /etc/tmpfiles.d/sshd.conf "$BACKUPDIR/sshd.conf.bak"
 fi
 
+if [ -f /etc/systemd/system/ssh.service.d/override.conf ]; then
+    mkdir -p "$BACKUPDIR/ssh.service.d"
+    cp -a /etc/systemd/system/ssh.service.d/override.conf "$BACKUPDIR/ssh.service.d/override.conf.bak"
+fi
+
 echo "==== INSTALL FILES ===="
-# 检查 rootfs 目录是否存在（解压后的文件系统目录）
 if [ ! -d rootfs ]; then
     echo "ERROR: rootfs directory missing"
     exit 1
 fi
 
-# 将 rootfs 目录下的所有文件拷贝到根目录 /，覆盖旧文件
 cp -a rootfs/. /
 
-# 确保检查脚本有可执行权限
 if [ -f /usr/local/bin/gec6818-check.sh ]; then
     chmod +x /usr/local/bin/gec6818-check.sh
 fi
 
 echo "==== FIX SSH RUNTIME DIRECTORY ===="
-# 创建 tmpfiles 配置目录（如果不存在）
+
+# 1. 用 tmpfiles 方式保证开机自动创建 /run/sshd
 mkdir -p /etc/tmpfiles.d
 
-# 写入 SSH 运行时目录的 tmpfiles 配置，确保每次启动时自动创建 /run/sshd
-# 这是解决 SSH 因缺少权限分离目录而启动失败的关键步骤
 cat > /etc/tmpfiles.d/sshd.conf << 'EOF'
 d /run/sshd 0755 root root -
 EOF
 
-# 如果系统支持 systemd-tmpfiles，立即应用该配置创建目录
 if command -v systemd-tmpfiles >/dev/null 2>&1; then
     systemd-tmpfiles --create /etc/tmpfiles.d/sshd.conf || true
 fi
 
-# 立即手动创建 SSH 运行时目录，确保当前启动不会失败
+# 2. 用 systemd RuntimeDirectory 方式保证 ssh.service 启动时自动创建 /run/sshd
+if command -v systemctl >/dev/null 2>&1; then
+    mkdir -p /etc/systemd/system/ssh.service.d
+
+    cat > /etc/systemd/system/ssh.service.d/override.conf << 'EOF'
+[Service]
+RuntimeDirectory=sshd
+RuntimeDirectoryMode=0755
+EOF
+
+    systemctl daemon-reload || true
+fi
+
+# 3. 当前运行环境立即创建目录，避免本次启动 SSH 失败
+mkdir -p /run/sshd
 mkdir -p /var/run/sshd
+chmod 0755 /run/sshd
 chmod 0755 /var/run/sshd
 
+echo "==== FIX SSH HOST KEYS ===="
+if command -v ssh-keygen >/dev/null 2>&1; then
+    ssh-keygen -A || true
+fi
+
 echo "==== CHECK SSHD CONFIG ===="
-# 用 sshd -t 验证 SSH 配置文件语法是否正确
 if [ -x /usr/sbin/sshd ]; then
     /usr/sbin/sshd -t
 fi
 
-sync                                 # 同步磁盘，确保所有写入完成
+echo "==== RESTART SSH SERVICE ===="
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl reset-failed ssh || true
+
+    if systemctl list-unit-files | grep -q '^ssh.service'; then
+        systemctl enable ssh || true
+        systemctl restart ssh
+        systemctl status ssh --no-pager || true
+    elif systemctl list-unit-files | grep -q '^sshd.service'; then
+        systemctl reset-failed sshd || true
+        systemctl enable sshd || true
+        systemctl restart sshd
+        systemctl status sshd --no-pager || true
+    else
+        echo "WARNING: ssh.service or sshd.service not found"
+    fi
+fi
+
+echo "==== CHECK SSH PORT ===="
+if command -v ss >/dev/null 2>&1; then
+    ss -lntp | grep ':22' || true
+elif command -v netstat >/dev/null 2>&1; then
+    netstat -lntp | grep ':22' || true
+fi
+
+sync
 
 echo "==== OTA DONE ===="
 echo "Current version:"
-cat /etc/gec6818-version             # 打印当前版本号
+if [ -f /etc/gec6818-version ]; then
+    cat /etc/gec6818-version
+else
+    echo "WARNING: /etc/gec6818-version not found"
+fi
 
 echo
 echo "Run check script:"
-# 执行升级后的检查脚本（如果存在且可执行）
 if [ -x /usr/local/bin/gec6818-check.sh ]; then
     /usr/local/bin/gec6818-check.sh
+else
+    echo "WARNING: /usr/local/bin/gec6818-check.sh not found or not executable"
 fi
+
 
 ```
 

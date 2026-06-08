@@ -1,827 +1,458 @@
-# OTA_Learn
-记录学习OTA过程
+# GEC6818 OTA Stage 1 学习记录
 
+这是一次基于 GEC6818 / S5P6818 开发板的 OTA 升级实验记录。
 
-# GEC6818 第一次本地 OTA 测试记录
-
-## 1. 测试目标
-
-本次测试目标是验证 GEC6818 在 SD 卡启动环境下是否可以完成最简单的本地 OTA 流程。
-
-本阶段 OTA 不更新 U-Boot，不更新 Kernel，不更新 DTB，也不更新完整 rootfs，只做最小闭环验证：
-
-1. 制作本地 OTA 包
-2. 拷贝 OTA 包到开发板
-3. 校验 OTA 包
-4. 覆盖少量 rootfs 文件
-5. 更新版本号
-6. 重启后确认系统仍可正常启动
-7. 记录 OTA 后出现的问题
-
-本次 OTA 从：
+本阶段目标不是实现完整商用 OTA，而是先跑通一个最小可用流程：
 
 ```text
-v0.5.0-gpio-led-key-pwm
+HTTP 下载固件 → sha256 校验 → 备份旧文件 → 更新 boot 分区 → 重启验证
 ```
 
-升级到：
+本次最终结果：
 
-```text
-v0.6.0-ota-sd-basic
-```
+- 成功通过局域网 HTTP 服务下载 `Image` 和 DTB
+- 成功校验 `sha256`
+- 成功将旧 `Image` 和旧 DTB 备份到 p3 分区
+- 成功将新 `Image` 和新 DTB 写入 p1 boot 分区
+- 更新后 hash 与服务器端一致
 
 ---
 
-## 2. OTA 前系统状态
+## 1. 环境说明
 
-当前系统运行在 SD 卡启动环境中，基础外设已经完成适配：
-
-| 模块 | 状态 | 说明 |
-| --- | --- | --- |
-| LCD | 正常 | RGB 800x480 显示正常 |
-| 触摸 | 正常 | I2C 触摸可用 |
-| 声卡 | 正常 | ALSA 设备已适配 |
-| 网口 | 正常 | 可通过 SSH 连接 |
-| LED | 正常 | D7-D11 已注册到 `/sys/class/leds/` |
-| 按键 | 正常 | gpio-keys 已注册 |
-| 蜂鸣器 | 正常 | PWM2 beeper 已适配 |
-| 启动介质 | SD 卡 | 暂未烧录 eMMC |
-
-OTA 前版本文件：
-
-```bash
-cat /etc/gec6818-version
-```
-
-输出：
+开发板：
 
 ```text
-v0.5.0-gpio-led-key-pwm
+GEC6818 / Smart6818
+SoC: Samsung S5P6818
+System: Ubuntu 20.04 LTS arm64 minimal
+Kernel: Linux 4.4.172-s5p6818
 ```
+
+启动结构：
+
+```text
+U-Boot
+  ↓
+p1 boot 分区
+  ↓
+Image + ramdisk.img + DTB
+  ↓
+kernel
+  ↓
+p2 / p3 OverlayFS rootfs
+```
+
+eMMC 分区：
+
+| 分区 | 作用 |
+|---|---|
+| `/dev/mmcblk0p1` | boot 分区，存放 `Image`、`ramdisk.img`、DTB |
+| `/dev/mmcblk0p2` | rootfs lowerdir，基础系统 |
+| `/dev/mmcblk0p3` | userdata，存放 overlay 和 OTA 备份 |
+
+本阶段只更新：
+
+```text
+Image
+s5p6818-gec6818-rev01.dtb
+```
+
+暂时不更新：
+
+```text
+ramdisk.img
+rootfs
+```
+
+原因是 `ramdisk.img` 和 rootfs 影响早期启动，风险更高。Stage 1 先验证最基础的 boot 文件远程更新流程。
 
 ---
 
-## 3. 第一次本地 OTA 包内容
+## 2. OTA 固件目录
 
-本次 OTA 包名称：
-
-```text
-gec6818-ota-v0.6.0.tar.gz
-```
-
-OTA 包主要内容：
+Windows 主机上准备固件目录：
 
 ```text
-gec6818-ota-v0.6.0/
+ota-firmware/
 ├── manifest.txt
-├── sha256sum.txt
-├── rootfs
-│   ├── etc
-│   │   └── gec6818-version
-│   └── usr
-│       └── local
-│           └── bin
-│               └── gec6818-check.sh
-└── scripts
+├── sha256sums.txt
+├── Image
+└── s5p6818-gec6818-rev01.dtb
 ```
 
-其中：
-
-```text
-manifest.txt
-```
-
-用于描述 OTA 包信息。
-
-```text
-sha256sum.txt
-```
-
-用于校验 OTA 包内文件完整性。
-
-```text
-rootfs/etc/gec6818-version
-```
-
-用于更新系统版本号。
-
-```text
-rootfs/usr/local/bin/gec6818-check.sh
-```
-
-用于 OTA 后检查开发板基础状态。
-
----
-
-## 4. OTA 升级脚本
-
-开发板上的 OTA 升级脚本为：
-
-```text
-/usr/local/bin/ota-local-update.sh
-```
-
-核心逻辑如下：
+`manifest.txt` 示例：
 
 ```bash
-#!/bin/sh
-set -eu
-
-PKG="$1"
-WORKDIR="/tmp/gec6818-ota"
-BACKUPDIR="/root/ota-backup"
-
-if [ -z "$PKG" ]; then
-    echo "Usage: ota-local-update.sh <ota-package.tar.gz>"
-    exit 1
-fi
-
-if [ ! -f "$PKG" ]; then
-    echo "ERROR: OTA package not found: $PKG"
-    exit 1
-fi
-
-echo "==== CLEAN WORKDIR ===="
-rm -rf "$WORKDIR"
-mkdir -p "$WORKDIR"
-
-echo "==== EXTRACT PACKAGE ===="
-tar -xzf "$PKG" -C "$WORKDIR"
-
-cd "$WORKDIR"
-
-echo "==== CHECK MANIFEST ===="
-if [ ! -f manifest.txt ]; then
-    echo "ERROR: manifest.txt missing"
-    exit 1
-fi
-
-cat manifest.txt
-
-if ! grep -q '^board=gec6818$' manifest.txt; then
-    echo "ERROR: board is not gec6818"
-    exit 1
-fi
-
-if ! grep -q '^type=file-update$' manifest.txt; then
-    echo "ERROR: unsupported OTA type"
-    exit 1
-fi
-
-echo "==== CHECK SHA256 ===="
-if [ ! -f sha256sum.txt ]; then
-    echo "ERROR: sha256sum.txt missing"
-    exit 1
-fi
-
-sha256sum -c sha256sum.txt
-
-echo "==== BACKUP OLD FILES ===="
-mkdir -p "$BACKUPDIR"
-
-if [ -f /etc/gec6818-version ]; then
-    cp -a /etc/gec6818-version "$BACKUPDIR/gec6818-version.bak"
-fi
-
-if [ -f /usr/local/bin/gec6818-check.sh ]; then
-    cp -a /usr/local/bin/gec6818-check.sh "$BACKUPDIR/gec6818-check.sh.bak"
-fi
-
-echo "==== INSTALL FILES ===="
-if [ ! -d rootfs ]; then
-    echo "ERROR: rootfs directory missing"
-    exit 1
-fi
-
-cp -a rootfs/. /
-
-if [ -f /usr/local/bin/gec6818-check.sh ]; then
-    chmod +x /usr/local/bin/gec6818-check.sh
-fi
-
-sync
-
-echo "==== OTA DONE ===="
-cat /etc/gec6818-version
+VERSION=2026.06.08-stage1
+BOARD=WC-gec6818
+UPDATE_IMAGE=1
+UPDATE_DTB=1
+UPDATE_RAMDISK=0
+UPDATE_ROOTFS=0
+IMAGE_FILE=Image
+DTB_FILE=s5p6818-gec6818-rev01.dtb
 ```
 
-执行 OTA：
+`sha256sums.txt` 示例：
 
 ```bash
-ota-local-update.sh /root/gec6818-ota-v0.6.0.tar.gz
-```
-
-OTA 后版本变为：
-
-```bash
-cat /etc/gec6818-version
-```
-
-输出：
-
-```text
-v0.6.0-ota-sd-basic
-```
-
-说明第一次本地 OTA 的基本流程已经跑通。
-
----
-
-## 5. OTA 后出现的问题
-
-OTA 完成并重启后，发现 SSH 无法连接开发板。
-
-现象：
-
-```text
-ssh 连接失败
-```
-
-在开发板串口终端中检查 SSH 服务状态：
-
-```bash
-systemctl status ssh
-```
-
-发现 SSH 服务启动失败。
-
-继续执行 SSH 配置检查：
-
-```bash
-/usr/sbin/sshd -t
-```
-
-输出错误：
-
-```text
-Missing privilege separation directory: /var/run/sshd
-```
-
-说明 SSHD 启动失败的直接原因是缺少运行时目录：
-
-```text
-/var/run/sshd
+2d92254d576f9b64bd238d2882c2be41a2f91aa52c34f20e3802e3fd376ee49b  manifest.txt
+8f7720d599cf30971a8ccec40e7a646e55e5f22a0c593fb8e8e072b9576a5ff5  Image
+604728b6baa568df5de139bb523793b915c5f3ca6b74283ee1b876b4d91d8077  s5p6818-gec6818-rev01.dtb
 ```
 
 ---
 
-## 6. 问题原因分析
+## 3. Windows 端启动 HTTP 服务
 
-SSH 服务启动时需要使用权限分离目录：
+进入固件目录：
 
-```text
-/var/run/sshd
+```powershell
+cd C:\ota-firmware
 ```
 
-如果这个目录不存在，`sshd` 会直接启动失败。
+启动 HTTP 服务：
 
-本次 OTA 后 SSH 失败的根因是：
-
-```text
-/var/run/sshd 目录不存在
+```powershell
+python -m http.server 8000 --bind 0.0.0.0
 ```
 
-在 Linux 系统中：
+如果开发板访问不到，需要放行 Windows 防火墙：
 
-```text
-/var/run
+```powershell
+netsh advfirewall firewall add rule name="OTA HTTP 8000" dir=in action=allow protocol=TCP localport=8000
 ```
 
-通常是运行时目录，很多系统中它实际指向：
-
-```text
-/run
-```
-
-而 `/run` 通常是 tmpfs，也就是内存文件系统。
-
-这类目录不是普通持久化文件目录，重启后需要由 systemd、tmpfiles 或服务脚本重新创建。
-
-本次 OTA 使用了类似下面的方式覆盖 rootfs：
+在开发板上测试：
 
 ```bash
-cp -a rootfs/. /
+wget http://192.168.88.1:8000/manifest.txt
 ```
 
-这个动作本身不会主动删除 `/var/run/sshd`，但是 OTA 后系统运行环境发生变化，导致 SSH 所需的运行时目录没有被正确创建。
-
-因此 SSH 服务启动时找不到：
-
-```text
-/var/run/sshd
-```
-
-最终报错：
-
-```text
-Missing privilege separation directory: /var/run/sshd
-```
-
-总结原因：
-
-```text
-OTA 后 SSHD 所需的运行时目录没有创建，导致 ssh 服务启动失败。
-```
+能正常下载说明 HTTP 服务可用。
 
 ---
 
-## 7. 临时修复方法
+## 4. OTA 脚本设计
 
-通过串口登录开发板后，手动创建 SSH 运行时目录：
-
-```bash
-mkdir -p /var/run/sshd
-```
-
-然后重启 SSH 服务：
+设备端脚本位置：
 
 ```bash
-systemctl restart ssh
+/usr/sbin/ota_stage1_update.sh
 ```
 
-查看 SSH 服务状态：
-
-```bash
-systemctl status ssh
-```
-
-如果状态正常，应该能看到 SSH 服务已经处于运行状态。
-
-再次检查 SSH 配置：
-
-```bash
-/usr/sbin/sshd -t
-```
-
-如果没有任何输出，说明 SSHD 配置检查通过。
-
-然后在电脑上重新连接开发板：
-
-```bash
-ssh root@开发板IP
-```
-
----
-
-## 8. 如果还有 SSH 密钥问题
-
-如果 `sshd -t` 继续报密钥相关错误，可以重新生成主机密钥：
-
-```bash
-ssh-keygen -A
-```
-
-然后再次检查：
-
-```bash
-/usr/sbin/sshd -t
-```
-
-再重启 SSH：
-
-```bash
-systemctl restart ssh
-systemctl status ssh
-```
-
-一般完整修复流程为：
-
-```bash
-mkdir -p /var/run/sshd
-ssh-keygen -A
-/usr/sbin/sshd -t
-systemctl restart ssh
-systemctl status ssh
-```
-
----
-
-## 9. 一劳永逸的 OTA 脚本修复
-
-为了避免下次 OTA 后 SSH 再次失败，需要在 OTA 脚本安装文件后增加 SSH 运行时目录修复。
-
-在：
-
-```bash
-cp -a rootfs/. /
-```
-
-后面增加：
-
-```bash
-mkdir -p /var/run/sshd
-chmod 0755 /var/run/sshd
-```
-
-建议修改后的 OTA 安装部分如下：
-
-```bash
-echo "==== INSTALL FILES ===="
-if [ ! -d rootfs ]; then
-    echo "ERROR: rootfs directory missing"
-    exit 1
-fi
-
-cp -a rootfs/. /
-
-if [ -f /usr/local/bin/gec6818-check.sh ]; then
-    chmod +x /usr/local/bin/gec6818-check.sh
-fi
-
-echo "==== FIX RUNTIME DIRECTORIES ===="
-mkdir -p /var/run/sshd
-chmod 0755 /var/run/sshd
-
-sync
-```
-
-这样每次 OTA 安装完成后，都会确保 SSHD 需要的目录存在。
-
----
-
-## 10. 更规范的 systemd 修复方式
-
-临时在 OTA 脚本里创建目录可以解决问题，但更规范的方式是让 systemd 在启动时自动创建 `/run/sshd`。
-
-可以创建 tmpfiles 配置：
-
-```bash
-cat > /etc/tmpfiles.d/sshd.conf << 'EOF'
-d /run/sshd 0755 root root -
-EOF
-```
-
-然后立即应用：
-
-```bash
-systemd-tmpfiles --create /etc/tmpfiles.d/sshd.conf
-```
-
-检查目录：
-
-```bash
-ls -ld /run/sshd /var/run/sshd
-```
-
-如果 `/var/run` 指向 `/run`，则 `/var/run/sshd` 也会正常存在。
-
-之后重启 SSH：
-
-```bash
-systemctl restart ssh
-systemctl status ssh
-```
-
-建议 OTA 脚本中也可以加入：
-
-```bash
-if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create /etc/tmpfiles.d/sshd.conf || true
-fi
-
-mkdir -p /var/run/sshd
-chmod 0755 /var/run/sshd
-```
-
-这样即使 `systemd-tmpfiles` 没有成功执行，也会用 `mkdir` 兜底。
-
----
-
-## 11. 推荐更新后的 ota-local-update.sh
-
-建议把 OTA 脚本更新为下面这个版本：
-
-```bash
-#!/bin/sh
-set -eu
-
-# ============ 参数检查 ============
-if [ $# -lt 1 ]; then
-    echo "Usage: ota-local-update.sh <ota-package.tar.gz>"
-    exit 1
-fi
-
-# ============ 变量定义 ============
-PKG="$1"
-WORKDIR="/tmp/gec6818-ota"
-BACKUPDIR="/root/ota-backup"
-
-# ============ 检查 OTA 包 ============
-if [ ! -f "$PKG" ]; then
-    echo "ERROR: OTA package not found: $PKG"
-    exit 1
-fi
-
-echo "==== CLEAN WORKDIR ===="
-rm -rf "$WORKDIR"
-mkdir -p "$WORKDIR"
-
-echo "==== EXTRACT PACKAGE ===="
-tar -xzf "$PKG" -C "$WORKDIR"
-
-cd "$WORKDIR"
-
-echo "==== CHECK MANIFEST ===="
-if [ ! -f manifest.txt ]; then
-    echo "ERROR: manifest.txt missing"
-    exit 1
-fi
-
-cat manifest.txt
-
-if ! grep -q '^board=gec6818$' manifest.txt; then
-    echo "ERROR: board is not gec6818"
-    exit 1
-fi
-
-if ! grep -q '^type=file-update$' manifest.txt; then
-    echo "ERROR: unsupported OTA type"
-    exit 1
-fi
-
-echo "==== CHECK SHA256 ===="
-if [ ! -f sha256sum.txt ]; then
-    echo "ERROR: sha256sum.txt missing"
-    exit 1
-fi
-
-sha256sum -c sha256sum.txt
-
-echo "==== BACKUP OLD FILES ===="
-mkdir -p "$BACKUPDIR"
-
-if [ -f /etc/gec6818-version ]; then
-    cp -a /etc/gec6818-version "$BACKUPDIR/gec6818-version.bak"
-fi
-
-if [ -f /usr/local/bin/gec6818-check.sh ]; then
-    cp -a /usr/local/bin/gec6818-check.sh "$BACKUPDIR/gec6818-check.sh.bak"
-fi
-
-if [ -f /etc/tmpfiles.d/sshd.conf ]; then
-    cp -a /etc/tmpfiles.d/sshd.conf "$BACKUPDIR/sshd.conf.bak"
-fi
-
-if [ -f /etc/systemd/system/ssh.service.d/override.conf ]; then
-    mkdir -p "$BACKUPDIR/ssh.service.d"
-    cp -a /etc/systemd/system/ssh.service.d/override.conf "$BACKUPDIR/ssh.service.d/override.conf.bak"
-fi
-
-echo "==== INSTALL FILES ===="
-if [ ! -d rootfs ]; then
-    echo "ERROR: rootfs directory missing"
-    exit 1
-fi
-
-cp -a rootfs/. /
-
-if [ -f /usr/local/bin/gec6818-check.sh ]; then
-    chmod +x /usr/local/bin/gec6818-check.sh
-fi
-
-echo "==== FIX SSH RUNTIME DIRECTORY ===="
-
-# 1. 用 tmpfiles 方式保证开机自动创建 /run/sshd
-mkdir -p /etc/tmpfiles.d
-
-cat > /etc/tmpfiles.d/sshd.conf << 'EOF'
-d /run/sshd 0755 root root -
-EOF
-
-if command -v systemd-tmpfiles >/dev/null 2>&1; then
-    systemd-tmpfiles --create /etc/tmpfiles.d/sshd.conf || true
-fi
-
-# 2. 用 systemd RuntimeDirectory 方式保证 ssh.service 启动时自动创建 /run/sshd
-if command -v systemctl >/dev/null 2>&1; then
-    mkdir -p /etc/systemd/system/ssh.service.d
-
-    cat > /etc/systemd/system/ssh.service.d/override.conf << 'EOF'
-[Service]
-RuntimeDirectory=sshd
-RuntimeDirectoryMode=0755
-EOF
-
-    systemctl daemon-reload || true
-fi
-
-# 3. 当前运行环境立即创建目录，避免本次启动 SSH 失败
-mkdir -p /run/sshd
-mkdir -p /var/run/sshd
-chmod 0755 /run/sshd
-chmod 0755 /var/run/sshd
-
-echo "==== FIX SSH HOST KEYS ===="
-if command -v ssh-keygen >/dev/null 2>&1; then
-    ssh-keygen -A || true
-fi
-
-echo "==== CHECK SSHD CONFIG ===="
-if [ -x /usr/sbin/sshd ]; then
-    /usr/sbin/sshd -t
-fi
-
-echo "==== RESTART SSH SERVICE ===="
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl reset-failed ssh || true
-
-    if systemctl list-unit-files | grep -q '^ssh.service'; then
-        systemctl enable ssh || true
-        systemctl restart ssh
-        systemctl status ssh --no-pager || true
-    elif systemctl list-unit-files | grep -q '^sshd.service'; then
-        systemctl reset-failed sshd || true
-        systemctl enable sshd || true
-        systemctl restart sshd
-        systemctl status sshd --no-pager || true
-    else
-        echo "WARNING: ssh.service or sshd.service not found"
-    fi
-fi
-
-echo "==== CHECK SSH PORT ===="
-if command -v ss >/dev/null 2>&1; then
-    ss -lntp | grep ':22' || true
-elif command -v netstat >/dev/null 2>&1; then
-    netstat -lntp | grep ':22' || true
-fi
-
-sync
-
-echo "==== OTA DONE ===="
-echo "Current version:"
-if [ -f /etc/gec6818-version ]; then
-    cat /etc/gec6818-version
-else
-    echo "WARNING: /etc/gec6818-version not found"
-fi
-
-echo
-echo "Run check script:"
-if [ -x /usr/local/bin/gec6818-check.sh ]; then
-    /usr/local/bin/gec6818-check.sh
-else
-    echo "WARNING: /usr/local/bin/gec6818-check.sh not found or not executable"
-fi
-
-
-```
-
----
-
-## 12. OTA 后必须执行的检查
-
-每次 OTA 后都要检查以下内容。
-
-检查版本：
-
-```bash
-cat /etc/gec6818-version
-```
-
-检查 SSHD 配置：
-
-```bash
-/usr/sbin/sshd -t
-```
-
-检查 SSH 服务：
-
-```bash
-systemctl status ssh
-```
-
-检查 SSH 运行时目录：
-
-```bash
-ls -ld /var/run/sshd
-ls -ld /run/sshd
-```
-
-检查网络：
-
-```bash
-ip link
-ip addr
-```
-
-检查网口日志：
-
-```bash
-dmesg | grep -Ei "eth|phy|link|stmmac|gmac"
-```
-
-检查 OTA 后基础状态：
-
-```bash
-gec6818-check.sh
-```
-
----
-
-## 13. 本次问题结论
-
-本次第一次本地 OTA 流程已经成功完成，版本文件已经从：
+脚本主要做这些事：
 
 ```text
-v0.5.0-gpio-led-key-pwm
+1. 接收 OTA 服务器地址
+2. 下载 manifest.txt
+3. 下载 sha256sums.txt
+4. 根据 manifest 下载 Image / DTB
+5. 执行 sha256 校验
+6. 挂载 p1 boot 分区
+7. 挂载 p3 userdata 分区
+8. 把旧 Image / DTB 备份到 p3
+9. 把新 Image / DTB 写入 p1
+10. sync 后提示重启
 ```
 
-升级到：
+本次采用的关键策略：
 
 ```text
-v0.6.0-ota-sd-basic
+旧文件备份到 p3，不备份到 p1
 ```
 
-OTA 后出现 SSH 无法连接问题。
+备份路径：
 
-直接原因：
-
-```text
-/var/run/sshd 不存在
+```bash
+/mnt/ota-data/ota-backup/boot/时间戳/
 ```
 
-报错信息：
+例如：
+
+```bash
+/mnt/ota-data/ota-backup/boot/20260608-115046/
+```
+
+这样可以避免 boot 分区空间被备份文件占满。
+
+---
+
+## 5. 执行 OTA 前检查
+
+先清理可能残留的挂载点：
+
+```bash
+sudo -s
+
+umount /tmp/bootpart 2>/dev/null || true
+umount /mnt/ota-data 2>/dev/null || true
+umount /mnt/p3 2>/dev/null || true
+umount /mnt/ota-boot 2>/dev/null || true
+```
+
+确认没有残留挂载：
+
+```bash
+mount | grep -E 'mmcblk0p1|mmcblk0p3|ota-boot|ota-data|tmp/bootpart|mnt/p3'
+```
+
+如果没有输出，说明挂载点干净。
+
+检查 p1 空间：
+
+```bash
+mkdir -p /mnt/ota-boot
+mount /dev/mmcblk0p1 /mnt/ota-boot
+df -h /mnt/ota-boot
+umount /mnt/ota-boot
+```
+
+本次遇到的问题是：
 
 ```text
-Missing privilege separation directory: /var/run/sshd
+lsblk 显示 p1 是 64M
+但 df 显示文件系统只有 23M，并且已经 100% 使用
 ```
 
 解决方法：
 
 ```bash
-mkdir -p /var/run/sshd
-systemctl restart ssh
+resize2fs /dev/mmcblk0p1
 ```
 
-长期修复：
+扩容后：
 
-1. 在 OTA 脚本中增加 `/var/run/sshd` 创建逻辑
-2. 增加 `/etc/tmpfiles.d/sshd.conf`
-3. OTA 后执行 `/usr/sbin/sshd -t` 检查
-4. OTA 后重启或检查 SSH 服务
+```text
+/dev/mmcblk0p1   60M   23M   35M  40%
+```
 
 ---
 
-## 14. 本次学习到的东西
+## 6. 执行 OTA
 
-第一次本地 OTA 不能只看版本文件是否更新成功，还必须检查系统关键服务是否还正常。
-
-尤其是以下目录属于运行时目录，OTA 时要特别小心：
-
-```text
-/run
-/var/run
-/tmp
-/var/tmp
-```
-
-这些目录不应该被当成普通 rootfs 静态文件长期依赖。
-
-对于 SSH 这类远程登录服务，OTA 后必须检查：
+执行：
 
 ```bash
-/usr/sbin/sshd -t
-systemctl status ssh
+/usr/sbin/ota_stage1_update.sh http://192.168.88.1:8000
 ```
 
-否则系统虽然启动了，但远程连不上，后续维护会很麻烦。
-
-本次问题说明：OTA 的第一阶段不只是“能复制文件”，还要保证升级后系统仍然可管理、可登录、可恢复。
-
----
-
-## 15. 下一次 OTA 前的改进清单
-
-下一次 OTA 前，必须完成以下改进：
-
-1. 更新 `ota-local-update.sh`
-2. 增加 `/var/run/sshd` 自动创建
-3. 增加 `/etc/tmpfiles.d/sshd.conf`
-4. OTA 后自动执行 `/usr/sbin/sshd -t`
-5. OTA 后保留 `/root/ota-backup/`
-6. OTA 包中不要随便包含 `/run`、`/var/run`、`/tmp`
-7. OTA 前后都记录 `systemctl status ssh`
-8. OTA 后通过串口和 SSH 双重确认系统可用
-
----
-
-## 16. 当前建议
-
-当前阶段继续使用 SD 卡启动学习 OTA 是正确的。
-
-因为这次 OTA 后 SSH 出问题，如果是在 eMMC 正式系统上操作，恢复会更麻烦。
-
-所以后续顺序应该是：
+关键成功输出：
 
 ```text
-1. 继续在 SD 卡系统上完善本地 OTA
-2. 修复 SSH 运行时目录问题
-3. 增加 OTA 后自检脚本
-4. 确认多次 OTA 后系统仍可 SSH 登录
-5. 再开始考虑 eMMC 烧录
-```
+[OTA-STAGE1] sha256 OK
+[OTA-STAGE1] Old Image backed up to: /mnt/ota-data/ota-backup/boot/20260608-115046/Image
+[OTA-STAGE1] Old DTB backed up to: /mnt/ota-data/ota-backup/boot/20260608-115046/s5p6818-gec6818-rev01.dtb
+[OTA-STAGE1] Image updated: Image
+[OTA-STAGE1] DTB updated: s5p6818-gec6818-rev01.dtb
+[OTA-STAGE1] OTA Stage 1 finished successfully
 ```
 
+---
 
-我还把原因表述修正得更准确了一点：`cp -a rootfs/. /` 本身不一定会删除 `/var/run/sshd`，真正关键是 `/var/run`、`/run` 属于运行时目录，OTA 后 SSH 所需目录没有被正确创建，所以 `sshd` 启动失败。这样写更适合作为技术记录。
+## 7. 重启前验证
+
+挂载 p1：
+
+```bash
+mkdir -p /mnt/ota-boot
+mount /dev/mmcblk0p1 /mnt/ota-boot
+```
+
+检查 hash：
+
+```bash
+sha256sum /mnt/ota-boot/Image /mnt/ota-boot/s5p6818-gec6818-rev01.dtb
+```
+
+正确结果：
+
+```text
+8f7720d599cf30971a8ccec40e7a646e55e5f22a0c593fb8e8e072b9576a5ff5  /mnt/ota-boot/Image
+604728b6baa568df5de139bb523793b915c5f3ca6b74283ee1b876b4d91d8077  /mnt/ota-boot/s5p6818-gec6818-rev01.dtb
+```
+
+检查 p3 备份：
+
+```bash
+mkdir -p /mnt/ota-data
+mount /dev/mmcblk0p3 /mnt/ota-data
+
+find /mnt/ota-data/ota-backup/boot -maxdepth 3 -type f -ls 2>/dev/null
+```
+
+应该能看到：
+
+```text
+/mnt/ota-data/ota-backup/boot/20260608-115046/Image
+/mnt/ota-data/ota-backup/boot/20260608-115046/s5p6818-gec6818-rev01.dtb
+```
+
+确认无误后重启：
+
+```bash
+sync
+umount /mnt/ota-boot 2>/dev/null || true
+umount /mnt/ota-data 2>/dev/null || true
+sync
+reboot
+```
+
+---
+
+## 8. 重启后验证
+
+查看内核：
+
+```bash
+uname -a
+```
+
+查看启动参数：
+
+```bash
+cat /proc/cmdline
+```
+
+确认 overlay：
+
+```bash
+mount | grep overlay
+```
+
+再次验证 boot 文件：
+
+```bash
+sudo -s
+mkdir -p /mnt/boot
+mount /dev/mmcblk0p1 /mnt/boot
+sha256sum /mnt/boot/Image /mnt/boot/s5p6818-gec6818-rev01.dtb
+umount /mnt/boot
+```
+
+如果 hash 仍然一致，说明新 `Image` 和 DTB 已经稳定写入。
+
+---
+
+## 9. 本次踩坑
+
+### WSL2 HTTP 服务无法被开发板访问
+
+一开始在 WSL2 里启动：
+
+```bash
+python3 -m http.server 8000
+```
+
+开发板访问 Windows 主机 IP 时一直卡住。
+
+原因是 WSL2 有自己的虚拟网络，局域网设备不一定能直接访问 WSL2 内部端口。
+
+最终改成 Windows 宿主机直接启动：
+
+```powershell
+python -m http.server 8000 --bind 0.0.0.0
+```
+
+问题解决。
+
+---
+
+### p1 分区是 64M，但文件系统只有 23M
+
+`lsblk` 显示：
+
+```text
+mmcblk0p1   64M
+```
+
+但 `df -h` 显示：
+
+```text
+/dev/mmcblk0p1   23M   23M     0 100%
+```
+
+说明分区本身是 64M，但 ext4 文件系统没有扩展到完整大小。
+
+执行：
+
+```bash
+resize2fs /dev/mmcblk0p1
+```
+
+扩容后 p1 可用空间恢复正常。
+
+---
+
+### p1 / p3 有残留挂载点
+
+曾经出现 p1 挂载在 `/tmp/bootpart`，p3 同时挂载在 `/mnt/p3` 和 `/mnt/ota-data` 的情况。
+
+OTA 前需要统一清理：
+
+```bash
+umount /tmp/bootpart 2>/dev/null || true
+umount /mnt/ota-data 2>/dev/null || true
+umount /mnt/p3 2>/dev/null || true
+umount /mnt/ota-boot 2>/dev/null || true
+```
+
+避免 OTA 脚本挂载时状态混乱。
+
+---
+
+### 备份不能放在 p1
+
+最初想把旧 `Image` 备份到 p1，但 p1 是 boot 分区，空间很小。
+
+如果同时存在：
+
+```text
+旧 Image
+新 Image.new
+旧 Image.bak
+```
+
+空间很容易爆掉。
+
+最终方案是：
+
+```text
+p1 只放启动文件
+p3 存放 OTA 备份
+```
+
+---
+
+## 10. 当前结论
+
+Stage 1 OTA 已经跑通：
+
+```text
+Windows HTTP 固件服务
+  ↓
+开发板 wget 下载 manifest / sha256 / Image / DTB
+  ↓
+sha256 校验
+  ↓
+旧 Image / DTB 备份到 p3
+  ↓
+新 Image / DTB 写入 p1
+  ↓
+重启验证
+```
+
+这是一个最小可用 OTA 闭环。
+
+后续可以继续扩展：
+
+```text
+Stage 2: U-Boot active_slot 双启动
+Stage 2: bootcount 自动回滚
+Stage 3: ramdisk 改造
+Stage 3: rootfs A/B 或 overlay 增量升级
+```
+
+---
+

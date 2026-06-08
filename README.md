@@ -134,7 +134,7 @@ wget http://192.168.88.1:8000/manifest.txt
 
 ---
 
-## 4. OTA 脚本设计
+## 4. OTA 脚本设计 (在最底下贴出)
 
 设备端脚本位置：
 
@@ -453,6 +453,235 @@ Stage 2: bootcount 自动回滚
 Stage 3: ramdisk 改造
 Stage 3: rootfs A/B 或 overlay 增量升级
 ```
-
 ---
 
+## 11. 脚本(这个是直接一键终端执行)
+```bash
+cat > /usr/sbin/ota_stage1_update.sh <<'EOF'
+#!/bin/sh
+#
+# GEC6818 OTA Stage 1
+#
+# 当前版本：只建议升级 Image + DTB
+#
+# 关键策略：
+#   1. 从 HTTP 下载 manifest.txt / sha256sums.txt / Image / DTB
+#   2. 先 sha256 校验
+#   3. 把旧 Image / 旧 DTB 备份到 p3，而不是备份到 p1
+#   4. p1 只保留当前启动文件，避免 64MB boot 分区空间爆掉
+#
+# 用法：
+#   sudo /usr/sbin/ota_stage1_update.sh http://192.168.88.1:8000
+#
+
+set -eu
+
+BASE_URL="${1:-}"
+WORKDIR="/tmp/ota-stage1"
+
+BOOT_DEV="/dev/mmcblk0p1"
+DATA_DEV="/dev/mmcblk0p3"
+
+BOOT_MNT="/mnt/ota-boot"
+DATA_MNT="/mnt/ota-data"
+
+BOOT_IMAGE_NAME="Image"
+BOOT_DTB_NAME="s5p6818-gec6818-rev01.dtb"
+BOOT_RAMDISK_NAME="ramdisk.img"
+
+log() {
+    echo "[OTA-STAGE1] $*"
+}
+
+die() {
+    echo "[OTA-STAGE1][ERROR] $*" >&2
+    exit 1
+}
+
+need_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+get_manifest_value() {
+    key="$1"
+    grep "^${key}=" "$WORKDIR/manifest.txt" | head -n 1 | cut -d= -f2-
+}
+
+download_file() {
+    file="$1"
+    url="${BASE_URL}/${file}"
+
+    log "Downloading $url"
+    wget -T 30 -t 2 -O "$WORKDIR/$file" "$url" || die "download failed: $url"
+}
+
+cleanup() {
+    set +e
+    mountpoint -q "$BOOT_MNT" 2>/dev/null && umount "$BOOT_MNT"
+    mountpoint -q "$DATA_MNT" 2>/dev/null && umount "$DATA_MNT"
+}
+trap cleanup EXIT INT TERM
+
+if [ -z "$BASE_URL" ]; then
+    echo "Usage:"
+    echo "  $0 http://192.168.88.1:8000"
+    exit 1
+fi
+
+BASE_URL="${BASE_URL%/}"
+
+need_cmd wget
+need_cmd sha256sum
+need_cmd mount
+need_cmd umount
+need_cmd cp
+need_cmd mv
+need_cmd rm
+need_cmd sync
+need_cmd df
+need_cmd ls
+
+log "Base URL: $BASE_URL"
+
+rm -rf "$WORKDIR"
+mkdir -p "$WORKDIR"
+
+download_file "manifest.txt"
+download_file "sha256sums.txt"
+
+VERSION="$(get_manifest_value VERSION || echo unknown)"
+BOARD="$(get_manifest_value BOARD || echo unknown)"
+
+UPDATE_IMAGE="$(get_manifest_value UPDATE_IMAGE || echo 0)"
+UPDATE_DTB="$(get_manifest_value UPDATE_DTB || echo 0)"
+UPDATE_RAMDISK="$(get_manifest_value UPDATE_RAMDISK || echo 0)"
+UPDATE_ROOTFS="$(get_manifest_value UPDATE_ROOTFS || echo 0)"
+
+IMAGE_FILE="$(get_manifest_value IMAGE_FILE || echo Image)"
+DTB_FILE="$(get_manifest_value DTB_FILE || echo s5p6818-gec6818-rev01.dtb)"
+RAMDISK_FILE="$(get_manifest_value RAMDISK_FILE || echo ramdisk.img)"
+ROOTFS_TAR="$(get_manifest_value ROOTFS_TAR || echo rootfs-update.tar.gz)"
+
+log "Version: $VERSION"
+log "Board: $BOARD"
+log "UPDATE_IMAGE=$UPDATE_IMAGE"
+log "UPDATE_DTB=$UPDATE_DTB"
+log "UPDATE_RAMDISK=$UPDATE_RAMDISK"
+log "UPDATE_ROOTFS=$UPDATE_ROOTFS"
+
+if [ "$BOARD" != "WC-gec6818" ]; then
+    die "board mismatch: expected WC-gec6818, got $BOARD"
+fi
+
+[ "$UPDATE_IMAGE" = "1" ] && download_file "$IMAGE_FILE"
+[ "$UPDATE_DTB" = "1" ] && download_file "$DTB_FILE"
+[ "$UPDATE_RAMDISK" = "1" ] && download_file "$RAMDISK_FILE"
+[ "$UPDATE_ROOTFS" = "1" ] && download_file "$ROOTFS_TAR"
+
+log "Checking sha256..."
+(
+    cd "$WORKDIR"
+    sha256sum -c sha256sums.txt
+) || die "sha256 check failed"
+
+log "sha256 OK"
+
+mkdir -p "$BOOT_MNT"
+mkdir -p "$DATA_MNT"
+
+if [ "$UPDATE_IMAGE" = "1" ] || [ "$UPDATE_DTB" = "1" ] || [ "$UPDATE_RAMDISK" = "1" ]; then
+    log "Mounting boot partition: $BOOT_DEV"
+    mount "$BOOT_DEV" "$BOOT_MNT"
+
+    log "Mounting data partition for backup: $DATA_DEV"
+    mount "$DATA_DEV" "$DATA_MNT"
+
+    TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo backup)"
+    BACKUP_DIR="$DATA_MNT/ota-backup/boot/$TS"
+    mkdir -p "$BACKUP_DIR"
+
+    log "Boot partition before update:"
+    df -h "$BOOT_MNT" || true
+    ls -lh "$BOOT_MNT" || true
+
+    # 清理上次失败可能留下的临时文件。
+    rm -f "$BOOT_MNT"/*.new
+    rm -f "$BOOT_MNT"/.new
+    rm -f "$BOOT_MNT"/Image.bak.*
+    rm -f "$BOOT_MNT"/s5p6818-gec6818-rev01.dtb.bak.*
+    rm -f "$BOOT_MNT"/ramdisk.img.bak.*
+    sync
+
+    # 把旧文件备份到 p3，不再占用 p1 空间。
+    if [ "$UPDATE_IMAGE" = "1" ] && [ -f "$BOOT_MNT/$BOOT_IMAGE_NAME" ]; then
+        cp -a "$BOOT_MNT/$BOOT_IMAGE_NAME" "$BACKUP_DIR/$BOOT_IMAGE_NAME"
+        log "Old Image backed up to: $BACKUP_DIR/$BOOT_IMAGE_NAME"
+    fi
+
+    if [ "$UPDATE_DTB" = "1" ] && [ -f "$BOOT_MNT/$BOOT_DTB_NAME" ]; then
+        cp -a "$BOOT_MNT/$BOOT_DTB_NAME" "$BACKUP_DIR/$BOOT_DTB_NAME"
+        log "Old DTB backed up to: $BACKUP_DIR/$BOOT_DTB_NAME"
+    fi
+
+    if [ "$UPDATE_RAMDISK" = "1" ] && [ -f "$BOOT_MNT/$BOOT_RAMDISK_NAME" ]; then
+        cp -a "$BOOT_MNT/$BOOT_RAMDISK_NAME" "$BACKUP_DIR/$BOOT_RAMDISK_NAME"
+        log "Old ramdisk backed up to: $BACKUP_DIR/$BOOT_RAMDISK_NAME"
+    fi
+
+    sync
+
+    # 更新 Image。
+    # 注意：这里仍然先写 Image.new，再 mv 成 Image。
+    # 这样至少避免写到一半直接覆盖原文件。
+    if [ "$UPDATE_IMAGE" = "1" ]; then
+        cp "$WORKDIR/$IMAGE_FILE" "$BOOT_MNT/$BOOT_IMAGE_NAME.new"
+        sync
+        mv "$BOOT_MNT/$BOOT_IMAGE_NAME.new" "$BOOT_MNT/$BOOT_IMAGE_NAME"
+        sync
+        log "Image updated: $BOOT_IMAGE_NAME"
+    fi
+
+    # 更新 DTB。
+    if [ "$UPDATE_DTB" = "1" ]; then
+        cp "$WORKDIR/$DTB_FILE" "$BOOT_MNT/$BOOT_DTB_NAME.new"
+        sync
+        mv "$BOOT_MNT/$BOOT_DTB_NAME.new" "$BOOT_MNT/$BOOT_DTB_NAME"
+        sync
+        log "DTB updated: $BOOT_DTB_NAME"
+    fi
+
+    # 当前阶段不建议升级 ramdisk。
+    if [ "$UPDATE_RAMDISK" = "1" ]; then
+        cp "$WORKDIR/$RAMDISK_FILE" "$BOOT_MNT/$BOOT_RAMDISK_NAME.new"
+        sync
+        mv "$BOOT_MNT/$BOOT_RAMDISK_NAME.new" "$BOOT_MNT/$BOOT_RAMDISK_NAME"
+        sync
+        log "ramdisk updated: $BOOT_RAMDISK_NAME"
+    fi
+
+    log "Boot partition after update:"
+    df -h "$BOOT_MNT" || true
+    ls -lh "$BOOT_MNT" || true
+
+    log "Backup saved at:"
+    echo "$BACKUP_DIR"
+    ls -lh "$BACKUP_DIR" || true
+
+    sync
+    umount "$BOOT_MNT"
+    umount "$DATA_MNT"
+fi
+
+if [ "$UPDATE_ROOTFS" = "1" ]; then
+    die "rootfs update is not enabled in this simplified Stage 1 script yet"
+fi
+
+log "OTA Stage 1 finished successfully"
+log "Image/DTB updated. Run: sync && reboot"
+EOF
+
+chmod +x /usr/sbin/ota_stage1_update.sh
+
+```
+
+---
